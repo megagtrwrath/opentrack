@@ -1,5 +1,6 @@
 /* Copyright (c) 2023, Khoa Nguyen <khoanguyen@3forcom.com>
-
+ * Linux gaze_origin port (c) 2026
+ *
  * Permission to use, copy, modify, and/or distribute this
  * software for any purpose with or without fee is hereby granted,
  * provided that the above copyright notice and this permission
@@ -10,6 +11,9 @@
 #include "compat/math-imports.hpp"
 
 #include <QMutexLocker>
+#include <QThread>
+#include <cmath>
+#include <dlfcn.h>
 
 static constexpr double rad_to_deg = 180.0 * M_1_PI;
 static constexpr double mm_to_cm = 0.1;
@@ -24,11 +28,10 @@ static void url_receiver(char const* url, void* user_data)
         strcpy(buffer, url);
 }
 
-static void head_pose_callback(tobii_head_pose_t const* head_pose, void* user_data)
+static void gaze_origin_callback(tobii_gaze_origin_t const* gaze_origin, void* user_data)
 {
-    // Store the latest head pose data in the supplied storage
-    tobii_head_pose_t* head_pose_storage = (tobii_head_pose_t*)user_data;
-    *head_pose_storage = *head_pose;
+    tobii_gaze_origin_t* storage = (tobii_gaze_origin_t*)user_data;
+    *storage = *gaze_origin;
 }
 
 tobii_tracker::tobii_tracker() = default;
@@ -38,7 +41,7 @@ tobii_tracker::~tobii_tracker()
     QMutexLocker lck(&mtx);
     if (device)
     {
-        tobii_head_pose_unsubscribe(device);
+        tobii_gaze_origin_unsubscribe(device);
         tobii_device_destroy(device);
     }
     if (api)
@@ -61,22 +64,47 @@ module_status tobii_tracker::start_tracker(QFrame*)
     if (tobii_error != TOBII_ERROR_NO_ERROR || url[0] == '\0')
     {
         tobii_api_destroy(api);
+        api = nullptr;
         return error("No stream engine compatible device(s) found.");
     }
 
-    tobii_error = tobii_device_create(api, url, &device);
-    if (tobii_error != TOBII_ERROR_NO_ERROR)
+    // The installed header declares tobii_device_create with 3 args, but the
+    // actual Tobii Stream Engine library requires 4 args including field_of_use.
+    // Use dlsym to call with the correct 4-arg signature.
+    typedef tobii_error_t (*device_create_fn_t)(tobii_api_t*, char const*, int, tobii_device_t**);
+    auto real_device_create = (device_create_fn_t)dlsym(RTLD_DEFAULT, "tobii_device_create");
+    if (!real_device_create)
     {
         tobii_api_destroy(api);
-        return error(QString("Failed to connect to %1.").arg(url));
+        api = nullptr;
+        return error("Failed to resolve tobii_device_create via dlsym.");
+    }
+    tobii_error = real_device_create(api, url, 1 /* FIELD_OF_USE_INTERACTIVE */, &device);
+    if (tobii_error != TOBII_ERROR_NO_ERROR)
+    {
+        // Retry once after a short delay
+        QThread::msleep(500);
+        tobii_error = real_device_create(api, url, 1, &device);
+    }
+    if (tobii_error != TOBII_ERROR_NO_ERROR)
+    {
+        const char* msg = tobii_error_message(tobii_error);
+        tobii_api_destroy(api);
+        api = nullptr;
+        return error(QString("Failed to connect to %1 (error %2: %3).")
+                     .arg(url).arg((int)tobii_error).arg(msg ? msg : "unknown"));
     }
 
-    tobii_error = tobii_head_pose_subscribe(device, head_pose_callback, &latest_head_pose);
+    // Use gaze_origin instead of head_pose -- head_pose is not supported
+    // on Tobii Eye Tracker 5 under Linux stream engine.
+    tobii_error = tobii_gaze_origin_subscribe(device, gaze_origin_callback, &latest_gaze_origin);
     if (tobii_error != TOBII_ERROR_NO_ERROR)
     {
         tobii_device_destroy(device);
+        device = nullptr;
         tobii_api_destroy(api);
-        return error("Failed to subscribe to head pose stream.");
+        api = nullptr;
+        return error("Failed to subscribe to gaze origin stream.");
     }
 
     return status_ok();
@@ -91,30 +119,73 @@ void tobii_tracker::data(double* data)
         return;
     }
 
-    // Tobii coordinate system is different from opentrack's
-    // Tobii: +x is to the right, +y is up, +z is towards the user
-    // Rotation xyz is in radians, x is pitch, y is yaw, z is roll
+    const auto& g = latest_gaze_origin;
+    const bool left_ok  = g.left_validity  == TOBII_VALIDITY_VALID;
+    const bool right_ok = g.right_validity == TOBII_VALIDITY_VALID;
 
-    if (latest_head_pose.position_validity == TOBII_VALIDITY_VALID)
+    if (!left_ok && !right_ok)
+        return;
+
+    // Compute midpoint of available eyes (in mm, Tobii coords)
+    float mx, my, mz;
+    if (left_ok && right_ok)
     {
-        data[TX] = -latest_head_pose.position_xyz[0] * mm_to_cm;
-        data[TY] = latest_head_pose.position_xyz[1] * mm_to_cm;
-        data[TZ] = latest_head_pose.position_xyz[2] * mm_to_cm;
+        mx = (g.left_xyz[0] + g.right_xyz[0]) * 0.5f;
+        my = (g.left_xyz[1] + g.right_xyz[1]) * 0.5f;
+        mz = (g.left_xyz[2] + g.right_xyz[2]) * 0.5f;
+    }
+    else if (left_ok)
+    {
+        mx = g.left_xyz[0]; my = g.left_xyz[1]; mz = g.left_xyz[2];
+    }
+    else
+    {
+        mx = g.right_xyz[0]; my = g.right_xyz[1]; mz = g.right_xyz[2];
     }
 
-    if (latest_head_pose.rotation_validity_xyz[0] == TOBII_VALIDITY_VALID)
+    // Capture baseline on first valid binocular frame
+    if (!baseline_set && left_ok && right_ok)
     {
-        data[Pitch] = latest_head_pose.rotation_xyz[0] * rad_to_deg;
+        baseline_xyz[0] = mx;
+        baseline_xyz[1] = my;
+        baseline_xyz[2] = mz;
+        float dx = g.right_xyz[0] - g.left_xyz[0];
+        float dy = g.right_xyz[1] - g.left_xyz[1];
+        float dz = g.right_xyz[2] - g.left_xyz[2];
+        baseline_ipd = std::sqrt(dx*dx + dy*dy + dz*dz);
+        baseline_set = true;
     }
 
-    if (latest_head_pose.rotation_validity_xyz[1] == TOBII_VALIDITY_VALID)
-    {
-        data[Yaw] = -latest_head_pose.rotation_xyz[1] * rad_to_deg;
-    }
+    // Translation: displacement from baseline in mm, convert to cm
+    // Tobii: +x right, +y up, +z toward user
+    // OpenTrack: +x right, +y up, +z forward (into screen)
+    data[TX] = -(mx - baseline_xyz[0]) * mm_to_cm;
+    data[TY] =  (my - baseline_xyz[1]) * mm_to_cm;
+    data[TZ] =  (mz - baseline_xyz[2]) * mm_to_cm;
 
-    if (latest_head_pose.rotation_validity_xyz[2] == TOBII_VALIDITY_VALID)
+    // Derive yaw and roll from inter-eye vector when both eyes valid
+    if (left_ok && right_ok)
     {
-        data[Roll] = latest_head_pose.rotation_xyz[2] * rad_to_deg;
+        float dx = g.right_xyz[0] - g.left_xyz[0];
+        float dy = g.right_xyz[1] - g.left_xyz[1];
+        float dz = g.right_xyz[2] - g.left_xyz[2];
+
+        // Yaw: rotation around Y axis -- when head turns, one eye moves
+        // forward/back relative to the other
+        data[Yaw] = -std::atan2(dz, dx) * rad_to_deg;
+
+        // Roll: tilt of the inter-eye line
+        data[Roll] = std::atan2(dy, dx) * rad_to_deg;
+
+        // Pitch: approximate from Z displacement relative to baseline
+        // (moving head forward/back changes the midpoint Z)
+        if (baseline_set && baseline_xyz[2] > 1.f)
+        {
+            float dz_mid = mz - baseline_xyz[2];
+            // Map Z displacement to a pitch angle -- rough approximation
+            // 100mm forward ~ looking down ~15 degrees
+            data[Pitch] = -(dz_mid / baseline_xyz[2]) * 60.0;
+        }
     }
 }
 

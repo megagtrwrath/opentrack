@@ -1,5 +1,6 @@
 /* Copyright (c) 2023, Khoa Nguyen <khoanguyen@3forcom.com>
-
+ * Linux gaze_origin port (c) 2026
+ *
  * Permission to use, copy, modify, and/or distribute this
  * software for any purpose with or without fee is hereby granted,
  * provided that the above copyright notice and this permission
@@ -27,13 +28,15 @@ private:
     tobii_api_t* api = nullptr;
     tobii_device_t* device = nullptr;
 
-    tobii_head_pose_t latest_head_pose{
-        .timestamp_us = 0LL,
-        .position_validity = TOBII_VALIDITY_INVALID,
-        .position_xyz = { 0.f, 0.f, 0.f },
-        .rotation_validity_xyz = { TOBII_VALIDITY_INVALID, TOBII_VALIDITY_INVALID, TOBII_VALIDITY_INVALID },
-        .rotation_xyz = { 0.f, 0.f, 0.f },
-    };
+    // We use gaze_origin (eye 3D positions in mm) instead of head_pose,
+    // because head_pose is not supported on Tobii Eye Tracker 5 under Linux.
+    tobii_gaze_origin_t latest_gaze_origin{};
+
+    // Baseline inter-eye distance captured during first valid frame (mm)
+    float baseline_ipd = 0.f;
+    // Baseline midpoint captured during first valid frame (mm)
+    float baseline_xyz[3] = { 0.f, 0.f, 0.f };
+    bool baseline_set = false;
 
     QMutex mtx;
 };
